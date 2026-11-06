@@ -125,7 +125,7 @@ services:
     container_name: tsdns
     restart: unless-stopped
     network_mode: host
-    command: dnsmasq -k --no-resolv --no-hosts --listen-address= --bind-dynamic --local=/example.com/ --address=/example.com/ --log-queries --log-facility=-
+    command: dnsmasq -k --no-resolv --no-hosts --listen-address=${TAILSCALE_IP} --bind-dynamic --local=/example.com/ --address=/example.com/ --log-queries --log-facility=-
 
   # ===================================================================
   #  APPS
