@@ -1,0 +1,683 @@
+# =====================================================================
+#  R720 / Debian VM - single stack
+#  Secrets, paths and versions example.com from .env
+#  Only these ports are published: 80, 443, 81 (NPM), 222 (Forgejo SSH),
+#  25565 (Minecraft), 7359/udp (Jellyfin discovery), 8554 + 1935 (mediamtx
+#  ingest), 8555 (Frigate WebRTC). Everything else is reached through NPM
+#  by container name on docker-network.
+#
+#  APPDATA = fast disk (NVMe): configs, databases, app state
+#  SAS     = bulk user data: photos, Nextcloud files, git repos, recordings
+#  SATA_*  = media, music, backups
+# =====================================================================
+
+services:
+  # ===================================================================
+  #  CORE
+  # ===================================================================
+
+  # reverse proxy + certs (admin UI on :81)
+  nginx-proxy-manager:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "81:81"
+    environment:
+      TZ: ${TZ}
+    volumes:
+      - ${APPDATA}/npm/data:/data
+      - ${APPDATA}/npm/letsencrypt:/etc/letsencrypt
+    extra_hosts:
+      # lets NPM reach host-network containers (netdata) via host.docker.internal
+      - "host.docker.internal:host-gateway"
+
+  # static site for example.com (proxy to portfolio:80)
+  portfolio:
+    image: nginx:alpine
+    container_name: portfolio
+    restart: unless-stopped
+    volumes:
+      - ${APPDATA}/portfolio:/usr/share/nginx/html:ro
+
+  # shared cache for Nextcloud + Immich
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${UNIPASS}", "--appendonly", "yes"]
+    environment:
+      REDISCLI_AUTH: ${UNIPASS}
+    volumes:
+      - ${APPDATA}/redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # shared Postgres: authentik (created here), nextcloud + forgejo (init script)
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${UNIUSER}
+      POSTGRES_PASSWORD: ${UNIPASS}
+      POSTGRES_DB: authentik
+    volumes:
+      - ${APPDATA}/postgres/data:/var/lib/postgresql/data
+      - ${APPDATA}/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d authentik"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # SSO: web + API (proxy to authentik-server:9000)
+  authentik-server:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG}
+    container_name: authentik-server
+    command: server
+    restart: unless-stopped
+    shm_size: 512mb
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?set AUTHENTIK_SECRET_KEY in .env}
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: ${UNIUSER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${UNIPASS}
+    volumes:
+      - ${APPDATA}/authentik/data:/data
+      - ${APPDATA}/authentik/templates:/templates
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG}
+    container_name: authentik-worker
+    command: worker
+    restart: unless-stopped
+    shm_size: 512mb
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?set AUTHENTIK_SECRET_KEY in .env}
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: ${UNIUSER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${UNIPASS}
+    volumes:
+      - ${APPDATA}/authentik/data:/data
+      - ${APPDATA}/authentik/certs:/certs
+      - ${APPDATA}/authentik/templates:/templates
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  tsdns:
+    build:
+      dockerfile_inline: |
+        FROM alpine:3
+        RUN apk add --no-cache dnsmasq
+    container_name: tsdns
+    restart: unless-stopped
+    network_mode: host
+    command: dnsmasq -k --no-resolv --no-hosts --listen-address= --bind-dynamic --local=/example.com/ --address=/example.com/ --log-queries --log-facility=-
+
+  # ===================================================================
+  #  APPS
+  # ===================================================================
+
+  # example.com -> synapse:8008
+  synapse-db:
+    image: postgres:14-alpine
+    container_name: synapse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${UNIUSER}
+      POSTGRES_PASSWORD: ${UNIPASS}
+      POSTGRES_DB: synapse
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - ${APPDATA}/synapse/db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d synapse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  synapse:
+    image: docker.io/matrixdotorg/synapse:${SYNAPSE_TAG}
+    container_name: synapse
+    restart: unless-stopped
+    environment:
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+      UID: ${PUID}
+      GID: ${PGID}
+      TZ: ${TZ}
+    volumes:
+      - ${APPDATA}/synapse/data:/data
+    depends_on:
+      synapse-db:
+        condition: service_healthy
+
+  # example.com -> vaultwarden:80
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: unless-stopped
+    environment:
+      DOMAIN: https://example.com
+      TZ: ${TZ}
+    volumes:
+      - ${APPDATA}/vaultwarden:/data
+
+  # example.com -> nextcloud:80
+  nextcloud:
+    image: nextcloud:${NEXTCLOUD_TAG:?set NEXTCLOUD_TAG in .env (match your current major version)}
+    container_name: nextcloud
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: ${UNIUSER}
+      POSTGRES_PASSWORD: ${UNIPASS}
+      NEXTCLOUD_ADMIN_USER: ${UNIUSER}
+      NEXTCLOUD_ADMIN_PASSWORD: ${UNIPASS}
+      NEXTCLOUD_TRUSTED_DOMAINS: example.com
+      REDIS_HOST: redis
+      REDIS_HOST_PASSWORD: ${UNIPASS}
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: example.com
+      TRUSTED_PROXIES: 172.30.0.0/24
+      TZ: ${TZ}
+    volumes:
+      - ${APPDATA}/nextcloud:/var/www/html
+      - ${SAS_2TB_1}/nextcloud/data:/var/www/html/data
+      # external storage (add in Nextcloud as "Local")
+      - ${SAS_2TB_1}/Wkx:/mnt/Wkx
+      - ${SAS_2TB_1}/Leisure:/mnt/Leisure
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  nextcloud-cron:
+    image: nextcloud:${NEXTCLOUD_TAG:?set NEXTCLOUD_TAG in .env (match your current major version)}
+    container_name: nextcloud-cron
+    restart: unless-stopped
+    entrypoint: /cron.sh
+    volumes:
+      - ${APPDATA}/nextcloud:/var/www/html
+      - ${SAS_2TB_1}/nextcloud/data:/var/www/html/data
+      - ${SAS_2TB_1}/Wkx:/mnt/Wkx
+      - ${SAS_2TB_1}/Leisure:/mnt/Leisure
+    depends_on:
+      - nextcloud
+
+  # example.com -> forgejo:3000 ; SSH on host port 222
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:15
+    container_name: forgejo
+    restart: unless-stopped
+    ports:
+      - "222:22"
+    environment:
+      USER_UID: ${PUID}
+      USER_GID: ${PGID}
+      TZ: ${TZ}
+      FORGEJO__database__DB_TYPE: postgres
+      FORGEJO__database__HOST: postgres:5432
+      FORGEJO__database__NAME: forgejo
+      FORGEJO__database__USER: ${UNIUSER}
+      FORGEJO__database__PASSWD: ${UNIPASS}
+      FORGEJO__database__SSL_MODE: disable
+      FORGEJO__server__DOMAIN: example.com
+      FORGEJO__server__SSH_DOMAIN: example.com
+      FORGEJO__server__ROOT_URL: https://example.com/
+      FORGEJO__server__HTTP_PORT: "3000"
+      FORGEJO__server__SSH_PORT: "222"
+    volumes:
+      - ${SAS_2TB_1}/forgejo:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # example.com -> ntfy:80
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: ntfy
+    command: serve
+    restart: unless-stopped
+    init: true
+    user: "${PUID}:${PGID}"
+    environment:
+      TZ: ${TZ}
+      NTFY_BASE_URL: https://example.com
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_CACHE_FILE: /var/cache/ntfy/cache.db
+    volumes:
+      - ${APPDATA}/ntfy/cache:/var/cache/ntfy
+      - ${APPDATA}/ntfy/etc:/etc/ntfy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --tries=1 http://localhost:80/v1/health -O - | grep -Eo '\"healthy\"\\s*:\\s*true' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # example.com -> searxng:8080
+  searxng-valkey:
+    image: docker.io/valkey/valkey:9-alpine
+    container_name: searxng-valkey
+    command: valkey-server --save 30 1 --loglevel warning
+    restart: unless-stopped
+    volumes:
+      - ${APPDATA}/searxng/valkey:/data
+
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: https://example.com/
+      SEARXNG_SECRET: ${UNIPASS}
+      SEARXNG_VALKEY_URL: valkey://searxng-valkey:6379/0
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    volumes:
+      - ${APPDATA}/searxng/config:/etc/searxng
+      - searxng-cache:/var/cache/searxng
+    depends_on:
+      - searxng-valkey
+
+  # example.com -> actual:5006
+  actual:
+    image: docker.io/actualbudget/actual-server:latest
+    container_name: actual
+    restart: unless-stopped
+    environment:
+      ACTUAL_OPENID_DISCOVERY_URL: https://example.com/application/o/actual/.well-known/openid-configuration
+      ACTUAL_OPENID_CLIENT_ID: ${ACTUAL_OIDC_ID}
+      ACTUAL_OPENID_CLIENT_SECRET: ${ACTUAL_OIDC_SECRET}
+      ACTUAL_OPENID_SERVER_HOSTNAME: https://example.com
+    volumes:
+      - ${APPDATA}/actual:/data
+    healthcheck:
+      test: ["CMD-SHELL", "node scripts/health-check.js"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # example.com -> excalidraw:80
+  excalidraw:
+    image: excalidraw/excalidraw:latest
+    container_name: excalidraw
+    restart: unless-stopped
+
+  # file manager UI (proxy to filebrowser:80) - first-run admin password is in `docker logs filebrowser`
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    container_name: filebrowser
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    volumes:
+      - ${SAS_2TB_1}:/srv/SAS
+      - ${SATA_4TB_1}:/srv/SATA_4TB_1
+      - ${SATA_4TB_2}:/srv/SATA_4TB_2
+      - ${SATA_8TB_3}:/srv/SATA_8TB_3
+      - ${APPDATA}/filebrowser/database:/database
+      - ${APPDATA}/filebrowser/config:/config
+
+  # 25565 published (forward on router for public play)
+  minecraft:
+    image: itzg/minecraft-server:latest
+    container_name: minecraft
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    ports:
+      - "25565:25565"
+    environment:
+      EULA: "TRUE"
+      TYPE: FABRIC
+      VERSION: LATEST
+      MEMORY: 8G
+      TZ: ${TZ}
+    volumes:
+      - ${SAS_2TB_1}/minecraft:/data
+
+  # ===================================================================
+  #  MEDIA
+  # ===================================================================
+
+  # example.com -> jellyfin:8096
+  # In Jellyfin dashboard > Playback > Transcoding, set transcode path to /transcode (RAM)
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    ports:
+      - "7359:7359/udp"
+    environment:
+      TZ: ${TZ}
+      JELLYFIN_PublishedServerUrl: https://example.com
+    volumes:
+      - ${APPDATA}/jellyfin/config:/config
+      - ${SAS_2TB_1}/jellyfin/cache:/cache
+      - ${SAS_2TB_1}/jellyfin/metadata:/config/data/metadata
+      - ${SAS_2TB_1}/jellyfin/trickplay:/config/data/trickplay
+      - ${SATA_8TB_3}/Jellyfin/Movies:/media/Movies:ro
+      - ${SATA_8TB_3}/Jellyfin/Anime:/media/Anime:ro
+      # add more libraries from the 4TB drives here, e.g.:
+      # - ${SATA_4TB_2}/Jellyfin/Shows:/media/Shows:ro
+      - type: tmpfs
+        target: /transcode
+        tmpfs:
+          size: 21474836480   # 20 GiB of RAM
+
+  # example.com -> navidrome:4533
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    environment:
+      TZ: ${TZ}
+      ND_SCANSCHEDULE: 1h
+      ND_MUSICFOLDER: /music
+    volumes:
+      - ${APPDATA}/navidrome:/data
+      - ${SAS_2TB_1}/Navidrome_Music:/music:ro
+
+  # example.com -> immich-server:2283
+  immich-database:
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    container_name: immich-database
+    restart: unless-stopped
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: ${UNIUSER}
+      POSTGRES_PASSWORD: ${UNIPASS}
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - ${APPDATA}/immich/postgres:/var/lib/postgresql/data
+    healthcheck:
+      disable: false
+
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION}
+    container_name: immich-server
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      DB_HOSTNAME: immich-database
+      DB_USERNAME: ${UNIUSER}
+      DB_PASSWORD: ${UNIPASS}
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: redis
+      REDIS_PASSWORD: ${UNIPASS}
+    volumes:
+      - ${SAS_2TB_1}/immich/upload:/usr/src/app/upload
+      # external library (add in Immich UI as /usr/src/app/external-library)
+      - ${SAS_2TB_1}/immich/library:/usr/src/app/external-library:ro
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      immich-database:
+        condition: service_healthy
+    healthcheck:
+      disable: false
+
+  # immich-machine-learning:
+  #   image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION}
+  #   container_name: immich-machine-learning
+  #   restart: unless-stopped
+  #   environment:
+  #     TZ: ${TZ}
+  #   volumes:
+  #     - ${APPDATA}/immich/model-cache:/cache
+  #   healthcheck:
+  #     disable: false
+
+  # ===================================================================
+  #  CAMERA
+  # ===================================================================
+
+  # Pi pushes to rtsp://<r720-ip>:8554/cam ; HLS on mediamtx:8888 via NPM (example.com)
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: mediamtx
+    restart: unless-stopped
+    ports:
+      - "8554:8554"   # RTSP
+      - "1935:1935"   # RTMP
+
+  # Frigate reads rtsp://mediamtx:8554/cam ; UI via NPM -> https://frigate:8971
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: frigate
+    restart: unless-stopped
+    stop_grace_period: 30s
+    shm_size: "512mb"
+    ports:
+      - "8555:8555/tcp"   # WebRTC
+      - "8555:8555/udp"
+    environment:
+      TZ: ${TZ}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ${APPDATA}/frigate:/config
+      - ${SAS_2TB_1}/frigate:/media/frigate
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 1000000000
+    depends_on:
+      - mediamtx
+
+  # ===================================================================
+  #  OPS / MONITORING
+  # ===================================================================
+
+  # image update notifications -> ntfy topic "diun-updates"
+  diun:
+    image: crazymax/diun:latest
+    container_name: diun
+    command: serve
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      DIUN_WATCH_SCHEDULE: "0 */6 * * *"
+      DIUN_WATCH_WORKERS: "20"
+      DIUN_WATCH_JITTER: 30s
+      DIUN_PROVIDERS_DOCKER: "true"
+      DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT: "true"
+      DIUN_NOTIF_NTFY_ENDPOINT: http://ntfy:80
+      DIUN_NOTIF_NTFY_TOPIC: diun-updates
+      DIUN_NOTIF_NTFY_PRIORITY: "3"
+    volumes:
+      - ${APPDATA}/diun:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - ntfy
+
+  # example.com -> homepage:3000
+  # runs as root (no PUID) so it can read docker.sock; its config files will be root-owned
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    container_name: homepage
+    restart: unless-stopped
+    environment:
+      HOMEPAGE_ALLOWED_HOSTS: example.com
+      TZ: ${TZ}
+    volumes:
+      - ${APPDATA}/homepage:/app/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  # portainer: proxy to https://portainer:9443 (scheme https)
+  portainer:
+    image: portainer/portainer-ce:lts
+    container_name: portainer
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${APPDATA}/portainer:/data
+
+  # example.com -> uptime-kuma:3001
+  uptime-kuma:
+    image: louislam/uptime-kuma:2
+    container_name: uptime-kuma
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      UMASK: "0022"
+    volumes:
+      - ${APPDATA}/uptime-kuma:/app/data
+
+  kuma-monitors:
+    image: python:3.12-slim
+    profiles: ["tools"]
+    environment:
+      KUMA_USER: ${UNIUSER}
+      KUMA_PASS: ${UNIPASS}
+    volumes:
+      - ./monitors.py:/monitors.py:ro
+    command: sh -c "pip install -q uptime-kuma-api && python /monitors.py"
+
+  # live host/container view, host network -> NPM target host.docker.internal:19999
+  netdata:
+    image: netdata/netdata:latest
+    container_name: netdata
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      PGID: ${DOCKER_GID}
+    volumes:
+      - ${APPDATA}/netdata/config:/etc/netdata
+      - ${APPDATA}/netdata/lib:/var/lib/netdata
+      - ${APPDATA}/netdata/cache:/var/cache/netdata
+      - /etc/passwd:/host/etc/passwd:ro
+      - /etc/group:/host/etc/group:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc/os-release:/host/etc/os-release:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  # history + dashboards: prometheus scrapes cadvisor, node-exporter, postgres-exporter
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=5GB
+      - --web.enable-lifecycle
+    volumes:
+      - ${APPDATA}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${APPDATA}/prometheus/data:/prometheus
+
+  # example.com -> grafana:3000
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    environment:
+      TZ: ${TZ}
+      GF_SECURITY_ADMIN_USER: ${UNIUSER}
+      GF_SECURITY_ADMIN_PASSWORD: ${UNIPASS}
+      GF_SERVER_ROOT_URL: https://example.com
+      GF_AUTH_GENERIC_OAUTH_ENABLED: "true"
+      GF_AUTH_GENERIC_OAUTH_NAME: Authentik
+      GF_AUTH_GENERIC_OAUTH_CLIENT_ID: ${GRAFANA_OIDC_ID}
+      GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET: ${GRAFANA_OIDC_SECRET}
+      GF_AUTH_GENERIC_OAUTH_SCOPES: openid profile email
+      GF_AUTH_GENERIC_OAUTH_USE_PKCE: "true"
+      GF_AUTH_GENERIC_OAUTH_AUTH_URL: https://example.com/application/o/authorize/
+      GF_AUTH_GENERIC_OAUTH_TOKEN_URL: http://authentik-server:9000/application/o/token/
+      GF_AUTH_GENERIC_OAUTH_API_URL: http://authentik-server:9000/application/o/userinfo/
+      GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH: contains(groups, 'authentik Admins') && 'Admin' || 'Viewer'
+      GF_AUTH_SIGNOUT_REDIRECT_URL: https://example.com/application/o/grafana/end-session/
+      GF_AUTH_GENERIC_OAUTH_AUTO_LOGIN: "true"
+    volumes:
+      - ${APPDATA}/grafana/data:/var/lib/grafana
+      - ${APPDATA}/grafana/provisioning:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+
+  # per-container metrics (if you move Docker's data-root, change /var/lib/docker below)
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+
+  # VM-level metrics (run prometheus-node-exporter on the Proxmox host too for the real hardware)
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro,rslave
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: postgres-exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: postgresql://${UNIUSER}:${UNIPASS}@postgres:5432/postgres?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # enable once iDRAC is reachable; Prometheus scrapes idrac-exporter:9348
+  idrac-exporter:
+    image: ghcr.io/mrlhansen/idrac_exporter:latest
+    container_name: idrac-exporter
+    restart: unless-stopped
+    volumes:
+      - ${APPDATA}/idrac-exporter/idrac.yml:/etc/prometheus/idrac.yml:ro
+
+networks:
+  default:
+    name: docker-network
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24   # matches TRUSTED_PROXIES on nextcloud
+
+volumes:
+  searxng-cache:
