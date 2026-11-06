@@ -1,6 +1,6 @@
 # =====================================================================
 #  R720 / Debian VM - single stack
-#  Secrets, paths and versions example.com from .env
+#  Secrets, paths and versions come from .env
 #  Only these ports are published: 80, 443, 81 (NPM), 222 (Forgejo SSH),
 #  25565 (Minecraft), 7359/udp (Jellyfin discovery), 8554 + 1935 (mediamtx
 #  ingest), 8555 (Frigate WebRTC). Everything else is reached through NPM
